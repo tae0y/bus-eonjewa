@@ -1,6 +1,7 @@
 """Config flow for Kakaobus integration."""
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any
 
@@ -10,51 +11,36 @@ import homeassistant.helpers.config_validation as cv
 from homeassistant import config_entries
 from homeassistant.core import callback
 from homeassistant.data_entry_flow import FlowResult
-import json
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
 from .const import (
     DOMAIN, CONF_STOP_ID, CONF_STOP_NAME, CONF_BUSES, CONF_QUIET_START, CONF_QUIET_END, 
     CONF_SCAN_INTERVAL, DEFAULT_QUIET_START, DEFAULT_QUIET_END, DEFAULT_SCAN_INTERVAL,
     MIN_SCAN_INTERVAL, MAX_SCAN_INTERVAL
 )
-from .coordinator import API_URL
+from .api import async_fetch_stop_data, build_bus_labels, describe_api_error
 
 _LOGGER = logging.getLogger(__name__)
 
-async def get_stop_info(stop_id: str) -> tuple[str, dict[str, str]] | None:
+async def get_stop_info(
+    hass: HomeAssistant, stop_id: str
+) -> tuple[str, dict[str, str]] | None:
     """Get stop name and list of buses. Returns (stop_name, {bus_name: label})."""
-    url = API_URL.format(stop_id)
-    timeout = aiohttp.ClientTimeout(total=10)
+    session = async_get_clientsession(hass)
     try:
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.get(url, headers={"User-Agent": "Mozilla/5.0"}) as response:
-                if response.status != 200:
-                    _LOGGER.error("API returned status %s for stop %s", response.status, stop_id)
-                    return None
-                text = await response.text()
-                data = json.loads(text)
-                
-                if "lines" not in data:
-                    _LOGGER.error("No 'lines' key in API response for stop %s", stop_id)
-                    return None
-                    
-                stop_name = data.get("name", stop_id)
-                    
-                bus_dict = {}
-                for line in data["lines"]:
-                    name = line.get("name")
-                    direction = line.get("arrival", {}).get("direction", "")
-                    if name:
-                        label = f"{name}"
-                        if direction:
-                            label += f" ({direction})"
-                        bus_dict[name] = label
-                return stop_name, bus_dict
-    except aiohttp.ClientError as err:
-        _LOGGER.error("Client error fetching stop %s: %s", stop_id, err)
+        data = await async_fetch_stop_data(session, stop_id)
+        stop_name = data.get("name", stop_id)
+        return stop_name, build_bus_labels(data)
+    except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as err:
+        _LOGGER.error("Error fetching stop %s: %s", stop_id, describe_api_error(err))
         return None
     except Exception as err:
-        _LOGGER.exception("Unexpected error fetching stop %s: %s", stop_id, err)
+        _LOGGER.exception(
+            "Unexpected error fetching stop %s: %s",
+            stop_id,
+            describe_api_error(err),
+        )
         return None
 
 
@@ -81,7 +67,7 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             self._abort_if_unique_id_configured()
 
             # validate and fetch buses
-            info = await get_stop_info(self.stop_id)
+            info = await get_stop_info(self.hass, self.stop_id)
             if info:
                 self.stop_name, self.available_buses = info
                 return await self.async_step_select_bus()
@@ -152,7 +138,7 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
                 available_buses = {}
             else:
                 # 1. Fetch latest "Available" buses
-                info = await get_stop_info(stop_id)
+                info = await get_stop_info(self.hass, stop_id)
                 if info:
                     _, available_buses = info
                 else:

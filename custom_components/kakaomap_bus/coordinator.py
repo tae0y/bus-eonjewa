@@ -4,12 +4,11 @@ from __future__ import annotations
 import asyncio
 from datetime import timedelta, datetime
 import logging
-import json
-import async_timeout
 import aiohttp
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.update_coordinator import (
     DataUpdateCoordinator,
     UpdateFailed,
@@ -20,10 +19,9 @@ from .const import (
     DOMAIN, CONF_STOP_ID, CONF_STOP_NAME, CONF_QUIET_START, CONF_QUIET_END, 
     CONF_SCAN_INTERVAL, DEFAULT_QUIET_START, DEFAULT_QUIET_END, DEFAULT_SCAN_INTERVAL
 )
+from .api import async_fetch_stop_data, build_bus_dict, describe_api_error
 
 _LOGGER = logging.getLogger(__name__)
-
-API_URL = "https://map.kakao.com/bus/stop.json?busstopid={}"
 
 class KakaoBusCoordinator(DataUpdateCoordinator):
     """Class to manage fetching KakaoMap Bus data."""
@@ -45,6 +43,7 @@ class KakaoBusCoordinator(DataUpdateCoordinator):
         self.entry = entry
         self.stop_id = entry.data[CONF_STOP_ID]
         self.stop_name = entry.data.get(CONF_STOP_NAME, self.stop_id)
+        self._session = async_get_clientsession(hass)
 
     @property
     def _quiet_hours_active(self) -> bool:
@@ -87,38 +86,10 @@ class KakaoBusCoordinator(DataUpdateCoordinator):
             # Return existing data if available, or empty dict to avoid errors
             return self.data if self.data else {}
 
-        url = API_URL.format(self.stop_id)
-
         try:
-            async with async_timeout.timeout(10):
-                async with aiohttp.ClientSession() as session:
-                    async with session.get(url, headers={"User-Agent": "Mozilla/5.0"}) as response:
-                        response.raise_for_status()
-                        text = await response.text()
-                        
-                        # API returns valid JSON
-                        data = json.loads(text)
-                        
-                        if "lines" not in data:
-                            _LOGGER.warning("Missing 'lines' key in API response for stop %s", self.stop_id)
-                            return {}
-                        
-                        # Convert list to dict keyed by bus ID or Name for O(1) lookup
-                        # We use Bus Name (route number) as key because IDs can change/be opaque
-                        # But wait, same bus number might have duplicates? Usually not per stop.
-                        # Using Bus Name (e.g., "126") is safer for the sensor to find its data.
-                        
-                        bus_dict = {}
-                        for line in data["lines"]:
-                            name = line.get("name")
-                            if name:
-                                bus_dict[name] = line
-                        
-                        return bus_dict
-
-        except (aiohttp.ClientError, asyncio.TimeoutError) as err:
-            raise UpdateFailed(f"Error communicating with API: {err}") from err
-        except json.JSONDecodeError as err:
-             raise UpdateFailed(f"Error parsing JSON: {err}") from err
+            data = await async_fetch_stop_data(self._session, self.stop_id)
+            return build_bus_dict(data)
+        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as err:
+            raise UpdateFailed(describe_api_error(err)) from err
         except Exception as err:
-            raise UpdateFailed(f"Unexpected error: {err}") from err
+            raise UpdateFailed(describe_api_error(err)) from err
